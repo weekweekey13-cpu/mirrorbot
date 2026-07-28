@@ -107,12 +107,18 @@ def load_dotenv_file() -> None:
         ROOT / "data" / "bot.env",
     ):
         _apply_env_file(p)
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-    API_HASH = os.getenv("API_HASH", "").strip()
-    api_id_raw = os.getenv("API_ID", "").strip()
+    def _clean(s: str) -> str:
+        # Render env paste often adds spaces/newlines → breaks Telegram URL
+        return "".join((s or "").split())
+
+    BOT_TOKEN = _clean(os.getenv("BOT_TOKEN", ""))
+    API_HASH = _clean(os.getenv("API_HASH", ""))
+    api_id_raw = _clean(os.getenv("API_ID", ""))
     API_ID = int(api_id_raw) if api_id_raw.isdigit() else 0
     API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-    DATA_FILE = Path(os.getenv("DATA_FILE", str(DATA_DIR / "config.json")))
+    data_file_raw = (os.getenv("DATA_FILE", str(DATA_DIR / "config.json")) or "").strip()
+    DATA_FILE = Path(data_file_raw)
+
 
 
 
