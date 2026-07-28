@@ -1,0 +1,12 @@
+{
+  "mirrors": {
+    "-1004396385044": {
+      "target_id": -1004388088545,
+      "owner_id": 606563037,
+      "source_title": "test",
+      "target_title": "yes",
+      "source_ref": "invite:Ljbpvzt3RAQyNThi",
+      "target_ref": "invite:B8uzTFh0KVUxNzZi"
+    }
+  }
+}

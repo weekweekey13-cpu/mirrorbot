@@ -1,0 +1,23 @@
+# Render Blueprint — Web Service (free) + keep-alive via UptimeRobot
+services:
+  - type: web
+    name: mirror-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: DATA_FILE
+        value: data/config.json
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_B64
+        sync: false
+      - key: CONFIG_JSON
+        sync: false
