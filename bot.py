@@ -15,10 +15,13 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import os
 import re
+import tempfile
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -72,8 +75,11 @@ album_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 # source chat id -> target chat id (resolved for telethon)
 mirrors_runtime: dict[int, int] = {}
+# source chat id -> "bot" | "user" (how we post to target)
+mirrors_post_via: dict[int, str] = {}
 client: TelegramClient | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
+_bot_username_cache: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +157,7 @@ def user_mirrors(data: dict[str, Any], user_id: int) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Bot API (UI only)
+# Bot API (UI + posting to user channels)
 # ---------------------------------------------------------------------------
 
 def api(method: str, **params: Any) -> dict[str, Any]:
@@ -182,6 +188,103 @@ def api(method: str, **params: Any) -> dict[str, Any]:
     if not payload.get("ok"):
         raise RuntimeError(f"{method} failed: {payload.get('description', payload)}")
     return payload["result"]
+
+
+def api_multipart(
+    method: str,
+    files: dict[str, tuple[str, bytes, str]],
+    **params: Any,
+) -> dict[str, Any]:
+    """POST multipart/form-data (for sendPhoto/sendDocument/...)."""
+    boundary = f"----duble{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    def add_field(name: str, value: str) -> None:
+        chunks.append(f"--{boundary}\r\n".encode())
+        chunks.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        chunks.append(value.encode("utf-8"))
+        chunks.append(b"\r\n")
+
+    for k, v in params.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            v = "true" if v else "false"
+        add_field(k, str(v))
+
+    for field, (filename, content, content_type) in files.items():
+        chunks.append(f"--{boundary}\r\n".encode())
+        chunks.append(
+            (
+                f'Content-Disposition: form-data; name="{field}"; '
+                f'filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode()
+        )
+        chunks.append(content)
+        chunks.append(b"\r\n")
+
+    chunks.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(chunks)
+    req = urllib.request.Request(
+        f"{API}/{method}",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(err_body)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
+    if not payload.get("ok"):
+        raise RuntimeError(f"{method} failed: {payload.get('description', payload)}")
+    return payload["result"]
+
+
+def bot_username() -> str:
+    global _bot_username_cache
+    if _bot_username_cache:
+        return _bot_username_cache
+    try:
+        me = api("getMe")
+        _bot_username_cache = (me.get("username") or "dublepostbot").lstrip("@")
+    except Exception:
+        _bot_username_cache = "dublepostbot"
+    return _bot_username_cache
+
+
+def bot_can_post(chat_id: int) -> bool:
+    """True if @dublepostbot is admin with post rights in the channel."""
+    try:
+        me = api("getMe")
+        member = api("getChatMember", chat_id=chat_id, user_id=me["id"])
+        status = member.get("status")
+        if status == "creator":
+            return True
+        if status == "administrator":
+            # broadcast channels
+            if member.get("can_post_messages") is True:
+                return True
+            # groups / supergroups
+            if member.get("can_manage_chat") is True:
+                return True
+            # some bots get all rights without explicit can_post_messages key
+            if "can_post_messages" not in member and "can_manage_chat" not in member:
+                return True
+        return False
+    except Exception as e:
+        logger.info("bot_can_post %s: %s", chat_id, e)
+        return False
 
 
 def send_message(
@@ -328,26 +431,31 @@ def entity_to_id_title(ent: Any, fallback: str = "") -> tuple[int, str]:
     return full_id, str(title)
 
 
-HELP_TEXT = """\
-📖 <b>Как это работает (чужие каналы)</b>
+def help_text() -> str:
+    bu = bot_username()
+    return f"""\
+📖 <b>Как это работает</b>
 
-Обычный бот <b>не может</b> читать чужой канал — Telegram не присылает посты, если бот не админ.
+Любой может настроить зеркало в этом боте.
 
-<b>DublePost</b> читает источник через <b>ваш аккаунт</b> (userbot):
-• публичный: https://t.me/name или @name
-• приватный: пригласительная ссылка
-  <code>https://t.me/+XXXX</code> или <code>https://t.me/joinchat/XXXX</code>
-• в <b>ваш</b> канал — ваш аккаунт должен уметь туда писать (вы админ)
+<b>1. Источник (чужой канал)</b>
+Читаем через служебный аккаунт бота:
+• публичный @name / https://t.me/name
+• приватный invite: https://t.me/+XXXX
 
-Если аккаунт ещё не в приватном канале — бот <b>вступит по ссылке</b> (если ссылка живая).
+Админ в чужом канале <b>не нужен</b>.
 
-<b>Настройка:</b>
-1. Один раз: <code>python login.py</code>
-2. В боте: «Настроить зеркало» → 2 ссылки
-3. В свой канал — ваш аккаунт админом
+<b>2. Ваш канал (куда дублировать)</b>
+Добавьте бота <b>@{bu}</b> администратором с правом
+<b>«Публикация сообщений» / Post messages</b>.
+
+Потом пришлите ссылку на ваш канал в боте.
 
 Копируются только <b>новые</b> посты после настройки.
 """
+
+
+HELP_TEXT = ""  # filled at runtime via help_text()
 
 
 # ---------------------------------------------------------------------------
@@ -463,30 +571,98 @@ async def resolve_channel_info(ref: str) -> tuple[int, str] | None:
 resolve_channel_info.last_error = ""  # type: ignore[attr-defined]
 
 
-async def can_post_to(target_id: int) -> bool:
-    """Проверяем, что аккаунт может писать в целевой канал."""
+async def can_post_userbot(target_id: int) -> bool:
+    """Userbot (login account) can write to channel."""
     assert client is not None
     try:
         perms = await client.get_permissions(target_id, "me")
         if perms is None:
             return False
-        # creator / admin with post, or open group
         if getattr(perms, "is_creator", False):
             return True
         if getattr(perms, "post_messages", None) is True:
             return True
         if getattr(perms, "send_messages", None) is True:
             return True
-        # some channels: is_admin
         if getattr(perms, "is_admin", False):
             return True
         return False
     except Exception as e:
-        logger.warning("can_post_to %s: %s", target_id, e)
+        logger.warning("can_post_userbot %s: %s", target_id, e)
         return False
 
 
-async def copy_one(msg: TlMessage, target_id: int) -> None:
+async def can_post_to(target_id: int) -> tuple[bool, str]:
+    """
+    Returns (ok, mode) where mode is 'bot' or 'user'.
+    Prefer Bot API so ANY user can use the bot (add @bot as admin).
+    """
+    if await asyncio.to_thread(bot_can_post, target_id):
+        return True, "bot"
+    if await can_post_userbot(target_id):
+        return True, "user"
+    return False, ""
+
+
+def _guess_bot_method(msg: TlMessage) -> tuple[str, str]:
+    """Return (BotAPI method, form field name)."""
+    if getattr(msg, "photo", None):
+        return "sendPhoto", "photo"
+    if getattr(msg, "video", None):
+        return "sendVideo", "video"
+    if getattr(msg, "animation", None):
+        return "sendAnimation", "animation"
+    if getattr(msg, "audio", None):
+        return "sendAudio", "audio"
+    if getattr(msg, "voice", None):
+        return "sendVoice", "voice"
+    if getattr(msg, "sticker", None):
+        return "sendSticker", "sticker"
+    return "sendDocument", "document"
+
+
+async def copy_one_via_bot(msg: TlMessage, target_id: int) -> None:
+    """Post using Bot API — works when user added @dublepostbot as admin."""
+    assert client is not None
+    if isinstance(msg, MessageService) or msg.action:
+        return
+    text = msg.message or ""
+    if msg.media:
+        path = await client.download_media(msg, file=tempfile.mktemp())
+        if not path:
+            if text:
+                await asyncio.to_thread(
+                    api, "sendMessage", chat_id=target_id, text=text
+                )
+            return
+        try:
+            method, field = _guess_bot_method(msg)
+            data = Path(path).read_bytes()
+            name = Path(path).name or "file.bin"
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            kwargs: dict[str, Any] = {"chat_id": target_id}
+            if text and method != "sendSticker":
+                kwargs["caption"] = text[:1024]
+            await asyncio.to_thread(
+                api_multipart,
+                method,
+                {field: (name, data, ctype)},
+                **kwargs,
+            )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    else:
+        if not text:
+            return
+        await asyncio.to_thread(
+            api, "sendMessage", chat_id=target_id, text=text, disable_web_page_preview=False
+        )
+
+
+async def copy_one_via_user(msg: TlMessage, target_id: int) -> None:
     assert client is not None
     if isinstance(msg, MessageService) or msg.action:
         return
@@ -512,26 +688,26 @@ async def copy_one(msg: TlMessage, target_id: int) -> None:
         )
 
 
-async def copy_album(messages: list[TlMessage], target_id: int) -> None:
-    assert client is not None
-    messages = sorted(messages, key=lambda m: m.id)
-    files = []
-    caption = None
-    entities = None
-    for i, m in enumerate(messages):
-        if m.media:
-            files.append(m.media)
-        if m.message and caption is None:
-            caption = m.message
-            entities = m.entities
-    if not files:
-        return
-    await client.send_file(
-        target_id,
-        file=files,
-        caption=caption,
-        formatting_entities=entities if caption else None,
-    )
+async def copy_one(msg: TlMessage, target_id: int, source_id: int | None = None) -> None:
+    via = "bot"
+    if source_id is not None:
+        via = mirrors_post_via.get(source_id, "bot")
+    if via == "user":
+        await copy_one_via_user(msg, target_id)
+    else:
+        try:
+            await copy_one_via_bot(msg, target_id)
+        except Exception as e:
+            logger.warning("bot copy failed, try userbot: %s", e)
+            await copy_one_via_user(msg, target_id)
+
+
+async def copy_album(
+    messages: list[TlMessage], target_id: int, source_id: int | None = None
+) -> None:
+    # albums: post one-by-one (Bot API media groups are heavier)
+    for m in sorted(messages, key=lambda x: x.id):
+        await copy_one(m, target_id, source_id=source_id)
 
 
 async def flush_album(key: tuple[int, int], target_id: int) -> None:
@@ -540,15 +716,15 @@ async def flush_album(key: tuple[int, int], target_id: int) -> None:
     album_tasks.pop(key, None)
     if not msgs:
         return
+    source_id = key[0]
     try:
-        await copy_album(msgs, target_id)
+        await copy_album(msgs, target_id, source_id=source_id)
         logger.info("Album %s msgs from %s -> %s", len(msgs), key[0], target_id)
     except Exception as e:
         logger.error("album copy failed: %s", e)
-        # fallback one by one
         for m in msgs:
             try:
-                await copy_one(m, target_id)
+                await copy_one(m, target_id, source_id=source_id)
             except Exception as e2:
                 logger.error("fallback copy: %s", e2)
 
@@ -602,13 +778,14 @@ async def on_new_message(event: events.NewMessage.Event) -> None:
         return
 
     try:
-        await copy_one(msg, target_id)
+        await copy_one(msg, target_id, source_id=source_id)
         logger.info(
-            "Copied msg %s: %s -> %s (out=%s)",
+            "Copied msg %s: %s -> %s (out=%s via=%s)",
             msg.id,
             source_id,
             target_id,
             getattr(msg, "out", None),
+            mirrors_post_via.get(source_id, "?"),
         )
     except Exception as e:
         logger.error("copy failed %s -> %s: %s", source_id, target_id, e)
@@ -636,22 +813,27 @@ async def on_new_message(event: events.NewMessage.Event) -> None:
 
 async def reload_mirrors() -> None:
     """Перечитать config и подписаться на источники."""
-    global mirrors_runtime
+    global mirrors_runtime, mirrors_post_via
     assert client is not None
     db = load_db()
     new_map: dict[int, int] = {}
+    new_via: dict[int, str] = {}
     for source_key, cfg in db.get("mirrors", {}).items():
         try:
             sid = int(source_key)
             tid = int(cfg["target_id"])
+            via = str(cfg.get("post_via") or "bot")
+            if via not in ("bot", "user"):
+                via = "bot"
             # ensure entities cached
             try:
                 await client.get_entity(sid)
             except Exception:
                 ref = cfg.get("source_ref")
                 if ref:
-                    ent = await resolve_entity(ref)
-                    sid = (await resolve_channel_info(ref) or (sid, ""))[0]
+                    info = await resolve_channel_info(ref)
+                    if info:
+                        sid = info[0]
             try:
                 await client.get_entity(tid)
             except Exception:
@@ -660,15 +842,34 @@ async def reload_mirrors() -> None:
                     info = await resolve_channel_info(ref)
                     if info:
                         tid = info[0]
+            # re-detect post path if missing
+            if not cfg.get("post_via"):
+                ok, via2 = await can_post_to(tid)
+                if ok:
+                    via = via2
+                    cfg["post_via"] = via
             new_map[sid] = tid
+            new_via[sid] = via
             # дублируем ключи, чтобы совпало с event.chat_id
             if sid < 0 and str(sid).startswith("-100"):
                 raw = int(str(sid)[4:])
                 new_map[raw] = tid
-            logger.info("Mirror active: %s -> %s (%s)", sid, tid, cfg.get("source_title"))
+                new_via[raw] = via
+            logger.info(
+                "Mirror active: %s -> %s (%s) via=%s",
+                sid,
+                tid,
+                cfg.get("source_title"),
+                via,
+            )
         except Exception as e:
             logger.error("load mirror %s: %s", source_key, e)
     mirrors_runtime = new_map
+    mirrors_post_via = new_via
+    try:
+        save_db(db)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -679,45 +880,45 @@ def handle_start(chat_id: int, user_id: int) -> None:
     pending.pop(user_id, None)
     data = load_db()
     has = bool(user_mirrors(data, user_id))
+    bu = bot_username()
     send_message(
         chat_id,
-        "👋 <b>DublePost</b>\n"
-        "Бот: @dublepostbot\n\n"
-        "Дублирую посты <b>из чужого канала</b> в ваш.\n\n"
+        f"👋 <b>DublePost</b>\n"
+        f"Бот: @{bu}\n\n"
+        "Дублирую посты <b>из чужого канала</b> в ваш.\n"
+        "Пользоваться может <b>кто угодно</b>.\n\n"
         "1️⃣ ссылка канала-источника (чужой)\n"
         "2️⃣ ссылка вашего канала\n\n"
-        "⚠️ Один раз на ПК/хостинге нужен вход аккаунта:\n"
-        "<code>python login.py</code>\n\n"
+        f"⚠️ В <b>свой</b> канал добавьте @{bu} админом\n"
+        "с правом «Публикация сообщений».\n\n"
         "Нажмите кнопку ниже 👇",
         reply_markup=main_kb(has),
     )
 
 
 def handle_help(chat_id: int) -> None:
-    send_message(chat_id, HELP_TEXT)
+    send_message(chat_id, help_text())
 
 
 def handle_setup(chat_id: int, user_id: int) -> None:
     if client is None or not client.is_connected():
         send_message(
             chat_id,
-            "❌ Userbot не запущен.\n"
-            "На сервере выполните <code>python login.py</code>, "
-            "затем снова <code>python bot.py</code>.",
+            "❌ Сервис временно недоступен (reader offline).\n"
+            "Попробуйте позже — админ поднимает хостинг.",
         )
         return
     pending[user_id] = {"step": "source"}
     send_message(
         chat_id,
         "📡 <b>Шаг 1/2</b>\n\n"
-        "Пришлите ссылку <b>канала-источника</b>.\n\n"
+        "Пришлите ссылку <b>канала-источника</b> (откуда копировать).\n\n"
         "Подходят:\n"
         "• https://t.me/name — публичный\n"
-        "• https://t.me/+XXXX — <b>пригласительная</b> (приватный)\n"
-        "• https://t.me/joinchat/XXXX — то же\n"
+        "• https://t.me/+XXXX — invite (приватный)\n"
+        "• https://t.me/joinchat/XXXX\n"
         "• @name\n\n"
-        "Для приватного: если аккаунт ещё не внутри — "
-        "бот вступит по ссылке автоматически.",
+        "Админ в чужом канале <b>не нужен</b>.",
         reply_markup=cancel_kb(),
     )
 
@@ -815,17 +1016,18 @@ async def handle_text_step_async(chat_id: int, user_id: int, text: str) -> None:
             "source_title": title,
             "source_ref": ref,
         }
+        bu = bot_username()
         send_message(
             chat_id,
             f"✅ Источник: <b>{title}</b>\n"
-            f"(читаем через ваш аккаунт — админ там <b>не нужен</b>)\n\n"
+            f"(админ в источнике <b>не нужен</b>)\n\n"
             "📤 <b>Шаг 2/2</b>\n\n"
-            "Пришлите ссылку <b>вашего</b> канала (куда дублировать).\n\n"
-            "Можно invite:\n"
-            "• https://t.me/+XXXX\n"
-            "• https://t.me/joinchat/XXXX\n"
-            "• или @public / https://t.me/name\n\n"
-            "Ваш аккаунт (login) должен быть <b>админом</b> с правом публикации.",
+            f"1) Добавьте <b>@{bu}</b> в <b>ваш</b> канал\n"
+            "   администратором с правом\n"
+            "   <b>«Публикация сообщений»</b>\n\n"
+            "2) Пришлите ссылку вашего канала:\n"
+            "• https://t.me/name или @name\n"
+            "• https://t.me/+XXXX (invite)\n",
             reply_markup=cancel_kb(),
         )
         return
@@ -840,12 +1042,16 @@ async def handle_text_step_async(chat_id: int, user_id: int, text: str) -> None:
         )
         return
 
-    if not await can_post_to(cid):
+    ok, via = await can_post_to(cid)
+    if not ok:
+        bu = bot_username()
         send_message(
             chat_id,
-            f"❌ Аккаунт не может писать в «{title}».\n"
-            "Добавьте <b>себя</b> (тот аккаунт, которым делали login) "
-            "админом канала с правом публикации, и пришлите ссылку снова.",
+            f"❌ Не могу писать в «{title}».\n\n"
+            f"Добавьте бота <b>@{bu}</b> администратором канала\n"
+            "с правом <b>«Публикация сообщений» / Post messages</b>,\n"
+            "подождите 10–20 сек и пришлите ссылку <b>снова</b>.\n\n"
+            "Без этого Telegram не даст боту постить.",
             reply_markup=cancel_kb(),
         )
         return
@@ -858,6 +1064,7 @@ async def handle_text_step_async(chat_id: int, user_id: int, text: str) -> None:
         "target_title": title,
         "source_ref": state["source_ref"],
         "target_ref": ref,
+        "post_via": via,
     }
     save_db(db)
     pending.pop(user_id, None)
@@ -866,13 +1073,14 @@ async def handle_text_step_async(chat_id: int, user_id: int, text: str) -> None:
     send_message(
         chat_id,
         "🎉 <b>Готово! Зеркало работает.</b>\n\n"
-        f"📡 Откуда (чужой): <b>{state['source_title']}</b>\n"
-        f"📤 Куда (ваш): <b>{title}</b>\n\n"
+        f"📡 Откуда: <b>{state['source_title']}</b>\n"
+        f"📤 Куда: <b>{title}</b>\n"
+        f"⚙️ Режим: <code>{'бот @' + bot_username() if via == 'bot' else 'userbot'}</code>\n\n"
         "Новые посты будут копироваться автоматически.\n"
         "Старые не переносятся.",
         reply_markup=main_kb(True),
     )
-    logger.info("Mirror by %s: %s -> %s", user_id, source_id, cid)
+    logger.info("Mirror by %s: %s -> %s via=%s", user_id, source_id, cid, via)
 
 
 def process_update(update: dict, loop: asyncio.AbstractEventLoop) -> None:
